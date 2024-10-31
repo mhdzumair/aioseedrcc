@@ -6,13 +6,12 @@ a Seedr account, including adding torrents, managing files and folders, and
 handling account settings.
 """
 
-import re
 from base64 import b64decode
-from functools import wraps
 from typing import Optional, Callable, Dict, Any
 
 import httpx
 
+from aioseedrcc.exception import SeedrException
 from aioseedrcc.login import Login
 from aioseedrcc.login import create_token
 
@@ -68,41 +67,68 @@ class Seedr:
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         await self._client.aclose()
 
-    @staticmethod
-    def auto_refresh(func):
+    async def _make_request(
+        self,
+        method: str,
+        func: str,
+        data: Optional[Dict[str, Any]] = None,
+        files: Optional[Dict[str, Any]] = None,
+        retry_count: int = 1,
+    ) -> Dict[str, Any]:
         """
-        Decorator to automatically refresh the token if it's expired.
-
-        If the API returns an 'expired_token' error, this decorator will attempt to
-        refresh the token and retry the original request.
+        Make a request to the Seedr API with automatic token refresh handling.
 
         Args:
-            func: The async function to wrap.
+            method: HTTP method ("GET" or "POST")
+            func: API function name
+            data: Optional POST data
+            files: Optional files to upload
+            retry_count: Number of retries attempted (internal use)
 
         Returns:
-            A wrapped version of the input function that handles token refreshing.
+            Dict[str, Any]: API response as dictionary
+
+        Raises:
+            SeedrException: If the API request fails after retries
         """
+        if retry_count > 3:
+            raise SeedrException("Max retry attempts reached")
 
-        @wraps(func)
-        async def wrapper(self, *args, **kwargs):
-            response = await func(self, *args, **kwargs)
-            try:
-                response_json = response.json()
-            except httpx.HTTPError:
-                return {"result": False, "code": 400, "error": response.text}
+        params = {"access_token": self._access_token, "func": func}
 
-            if "error" in response_json and response_json["error"] == "expired_token":
+        try:
+            response = await self._client.request(
+                method, self.BASE_URL, params=params, data=data, files=files
+            )
+            response.raise_for_status()
+            result = response.json()
+
+            # Handle expired token
+            if isinstance(result, dict) and result.get("error") == "expired_token":
+                if retry_count > 1:
+                    raise SeedrException("Token refresh failed")
+
                 refresh_response = await self.refresh_token()
-
                 if "error" in refresh_response:
-                    return refresh_response
+                    raise SeedrException(
+                        f"Token refresh failed: {refresh_response['error']}"
+                    )
 
-                response = await func(self, *args, **kwargs)
-                response_json = response.json()
+                # Retry the request with new token
+                return await self._make_request(
+                    method, func, data, files, retry_count + 1
+                )
 
-            return response_json
+            return result
 
-        return wrapper
+        except httpx.HTTPError as e:
+            raise SeedrException(f"HTTP request failed: {str(e)}") from e
+        except ValueError as e:
+            raise SeedrException(f"Invalid JSON response: {str(e)}") from e
+        except (httpx.TransportError, httpx.ConnectTimeout):
+            return await self._make_request(method, func, data, files, retry_count + 1)
+        except Exception as e:
+            raise SeedrException(f"Request failed: {str(e)}") from e
 
     async def test_token(self) -> Dict[str, Any]:
         """
@@ -116,10 +142,7 @@ class Seedr:
             ...     result = await seedr.test_token()
             ...     print(result)
         """
-        params = {"access_token": self._access_token, "func": "test"}
-
-        response = await self._client.get(self.BASE_URL, params=params)
-        return response.json()
+        return await self._make_request("GET", "test")
 
     async def refresh_token(self) -> Dict[str, Any]:
         """
@@ -135,71 +158,74 @@ class Seedr:
             ...     new_token_info = await seedr.refresh_token()
             ...     print(seedr.token)  # This will be the new token
         """
-        if self._refresh_token:
-            url = "https://www.seedr.cc/oauth_test/token.php"
-            data = {
-                "grant_type": "refresh_token",
-                "refresh_token": self._refresh_token,
-                "client_id": "seedr_chrome",
-            }
-            response = await self._client.post(url, data=data)
-            response_json = response.json()
-        else:
-            login = Login()
-            response_json = await login.authorize(device_code=self._device_code)
+        try:
+            if self._refresh_token:
+                url = "https://www.seedr.cc/oauth_test/token.php"
+                data = {
+                    "grant_type": "refresh_token",
+                    "refresh_token": self._refresh_token,
+                    "client_id": "seedr_chrome",
+                }
+                response = await self._client.post(url, data=data)
+                response.raise_for_status()
+                response_json = response.json()
+            else:
+                async with Login(client=self._client) as login:
+                    response_json = await login.authorize(device_code=self._device_code)
 
-        if "access_token" in response_json:
-            self._access_token = response_json["access_token"]
-            self.token = create_token(
-                response_json, self._refresh_token, self._device_code
-            )
-            if self._token_refresh_callback:
-                await self._token_refresh_callback(
-                    self, **self._token_refresh_callback_kwargs
+            if "access_token" in response_json:
+                self._access_token = response_json["access_token"]
+                self.token = create_token(
+                    response_json, self._refresh_token, self._device_code
                 )
+                if self._token_refresh_callback:
+                    await self._token_refresh_callback(
+                        self, **self._token_refresh_callback_kwargs
+                    )
+                return response_json
+            else:
+                raise SeedrException("No access token in refresh response")
 
-        return response_json
+        except httpx.HTTPError as e:
+            raise SeedrException(f"Token refresh request failed: {str(e)}") from e
+        except Exception as e:
+            raise SeedrException(f"Token refresh failed: {str(e)}") from e
 
-    @auto_refresh
-    async def get_settings(self) -> httpx.Response:
+    async def get_settings(self) -> Dict[str, Any]:
         """
         Retrieve the user's account settings.
 
         Returns:
-            httpx.Response: The API response containing the user's settings.
+            Dict[str, Any]: The API response containing the user's settings.
 
         Example:
             >>> async with Seedr(token='your_token_here') as seedr:
             ...     settings = await seedr.get_settings()
-            ...     print(settings.json())
+            ...     print(settings)
         """
-        params = {"access_token": self._access_token, "func": "get_settings"}
-        return await self._client.get(self.BASE_URL, params=params)
+        return await self._make_request("GET", "get_settings")
 
-    @auto_refresh
-    async def get_memory_bandwidth(self) -> httpx.Response:
+    async def get_memory_bandwidth(self) -> Dict[str, Any]:
         """
         Retrieve the memory and bandwidth usage information.
 
         Returns:
-            httpx.Response: The API response containing memory and bandwidth usage data.
+            Dict[str, Any]: The API response containing memory and bandwidth usage data.
 
         Example:
             >>> async with Seedr(token='your_token_here') as seedr:
             ...     usage = await seedr.get_memory_bandwidth()
-            ...     print(usage.json())
+            ...     print(usage)
         """
-        params = {"access_token": self._access_token, "func": "get_memory_bandwidth"}
-        return await self._client.get(self.BASE_URL, params=params)
+        return await self._make_request("GET", "get_memory_bandwidth")
 
-    @auto_refresh
     async def add_torrent(
         self,
         magnet_link: Optional[str] = None,
         torrent_file: Optional[str] = None,
         wishlist_id: Optional[str] = None,
         folder_id: str = "-1",
-    ) -> httpx.Response:
+    ) -> Dict[str, Any]:
         """
         Add a torrent to the Seedr account for downloading.
 
@@ -210,20 +236,19 @@ class Seedr:
             folder_id (str): The folder ID to add the torrent to. Default to '-1' (root folder).
 
         Returns:
-            httpx.Response: The API response after adding the torrent.
+            Dict[str, Any]: The API response after adding the torrent.
 
         Example:
             Adding a torrent using a magnet link:
                 >>> async with Seedr(token='your_token_here') as seedr:
                 ...     result = await seedr.add_torrent(magnet_link='magnet:?xt=urn:btih:...')
-                ...     print(result.json())
+                ...     print(result)
 
             Adding a torrent from a local file:
                 >>> async with Seedr(token='your_token_here') as seedr:
                 ...     result = await seedr.add_torrent(torrent_file='/path/to/file.torrent')
-                ...     print(result.json())
+                ...     print(result)
         """
-        params = {"access_token": self._access_token, "func": "add_torrent"}
         data = {
             "torrent_magnet": magnet_link,
             "wishlist_id": wishlist_id,
@@ -232,17 +257,18 @@ class Seedr:
         files = {}
 
         if torrent_file:
-            if re.match(r"^https?://", torrent_file):
-                file_response = await self._client.get(torrent_file)
-                files = {"torrent_file": ("torrent_file", file_response.content)}
-            else:
-                files = {"torrent_file": open(torrent_file, "rb")}
+            try:
+                if torrent_file.startswith(("http://", "https://")):
+                    response = await self._client.get(torrent_file)
+                    response.raise_for_status()
+                    files = {"torrent_file": ("torrent_file", response.content)}
+                else:
+                    files = {"torrent_file": open(torrent_file, "rb")}
+            except (httpx.HTTPError, IOError) as e:
+                raise SeedrException(f"Failed to read torrent file: {str(e)}") from e
 
-        return await self._client.post(
-            self.BASE_URL, params=params, data=data, files=files
-        )
+        return await self._make_request("POST", "add_torrent", data=data, files=files)
 
-    @auto_refresh
     async def scan_page(self, url: str) -> Dict[str, Any]:
         """
         Scan a page and return a list of torrents.
@@ -260,12 +286,8 @@ class Seedr:
             ...     result = await seedr.scan_page('https://1337x.to/torrent/1234')
             ...     print(result)
         """
-        params = {"access_token": self._access_token, "func": "scan_page"}
-        data = {"url": url}
-        response = await self._client.post(self.BASE_URL, params=params, data=data)
-        return response.json()
+        return await self._make_request("POST", "scan_page", data={"url": url})
 
-    @auto_refresh
     async def create_archive(self, folder_id: str) -> Dict[str, Any]:
         """
         Create an archive link of a folder.
@@ -281,13 +303,10 @@ class Seedr:
             ...     result = await seedr.create_archive('12345')
             ...     print(result)
         """
-        params = {"access_token": self._access_token, "func": "create_empty_archive"}
         data = {"archive_arr": f'[{{"type":"folder","id":{folder_id}}}]'}
-        response = await self._client.post(self.BASE_URL, params=params, data=data)
-        return response.json()
+        return await self._make_request("POST", "create_empty_archive", data=data)
 
-    @auto_refresh
-    async def fetch_file(self, file_id: str) -> httpx.Response:
+    async def fetch_file(self, file_id: str) -> Dict[str, Any]:
         """
         Create a download link for a file.
 
@@ -295,19 +314,17 @@ class Seedr:
             file_id (str): The ID of the file to fetch.
 
         Returns:
-            httpx.Response: The API response containing the download link.
+            Dict[str, Any]: The API response containing the download link.
 
         Example:
             >>> async with Seedr(token='your_token_here') as seedr:
             ...     file_info = await seedr.fetch_file('12345')
-            ...     print(file_info.json())
+            ...     print(file_info)
         """
-        params = {"access_token": self._access_token, "func": "fetch_file"}
         data = {"folder_file_id": file_id}
-        return await self._client.post(self.BASE_URL, params=params, data=data)
+        return await self._make_request("POST", "fetch_file", data=data)
 
-    @auto_refresh
-    async def delete_item(self, item_id: str, item_type: str) -> httpx.Response:
+    async def delete_item(self, item_id: str, item_type: str) -> Dict[str, Any]:
         """
         Delete a file, folder, or torrent.
 
@@ -316,21 +333,19 @@ class Seedr:
             item_type (str): The type of the item ('file', 'folder', or 'torrent').
 
         Returns:
-            httpx.Response: The API response after deleting the item.
+            Dict[str, Any]: The API response after deleting the item.
 
         Example:
             >>> async with Seedr(token='your_token_here') as seedr:
             ...     result = await seedr.delete_item('12345', 'file')
-            ...     print(result.json())
+            ...     print(result)
         """
-        params = {"access_token": self._access_token, "func": "delete"}
         data = {"delete_arr": f'[{{"type":"{item_type}","id":{item_id}}}]'}
-        return await self._client.post(self.BASE_URL, params=params, data=data)
+        return await self._make_request("POST", "delete", data=data)
 
-    @auto_refresh
     async def rename_item(
         self, item_id: str, new_name: str, item_type: str
-    ) -> httpx.Response:
+    ) -> Dict[str, Any]:
         """
         Rename a file or folder.
 
@@ -340,19 +355,17 @@ class Seedr:
             item_type (str): The type of the item ('file' or 'folder').
 
         Returns:
-            httpx.Response: The API response after renaming the item.
+            Dict[str, Any]: The API response after renaming the item.
 
         Example:
             >>> async with Seedr(token='your_token_here') as seedr:
             ...     result = await seedr.rename_item('12345', 'New Name', 'file')
-            ...     print(result.json())
+            ...     print(result)
         """
-        params = {"access_token": self._access_token, "func": "rename"}
         data = {"rename_to": new_name, f"{item_type}_id": item_id}
-        return await self._client.post(self.BASE_URL, params=params, data=data)
+        return await self._make_request("POST", "rename", data=data)
 
-    @auto_refresh
-    async def list_contents(self, folder_id: str = "0") -> httpx.Response:
+    async def list_contents(self, folder_id: str = "0") -> Dict[str, Any]:
         """
         List the contents of a folder.
 
@@ -360,19 +373,17 @@ class Seedr:
             folder_id (str): The ID of the folder to list. Defaults to '0' (root folder).
 
         Returns:
-            httpx.Response: The API response containing the folder contents.
+            Dict[str, Any]: The API response containing the folder contents.
 
         Example:
             >>> async with Seedr(token='your_token_here') as seedr:
             ...     contents = await seedr.list_contents()
-            ...     print(contents.json())
+            ...     print(contents)
         """
-        params = {"access_token": self._access_token, "func": "list_contents"}
         data = {"content_type": "folder", "content_id": folder_id}
-        return await self._client.post(self.BASE_URL, params=params, data=data)
+        return await self._make_request("POST", "list_contents", data=data)
 
-    @auto_refresh
-    async def add_folder(self, name: str) -> httpx.Response:
+    async def add_folder(self, name: str) -> Dict[str, Any]:
         """
         Create a new folder.
 
@@ -380,18 +391,16 @@ class Seedr:
             name (str): The name of the new folder.
 
         Returns:
-            httpx.Response: The API response after creating the folder.
+            Dict[str, Any]: The API response after creating the folder.
 
         Example:
             >>> async with Seedr(token='your_token_here') as seedr:
             ...     result = await seedr.add_folder('New Folder')
-            ...     print(result.json())
+            ...     print(result)
         """
-        params = {"access_token": self._access_token, "func": "add_folder"}
         data = {"name": name}
-        return await self._client.post(self.BASE_URL, params=params, data=data)
+        return await self._make_request("POST", "add_folder", data=data)
 
-    @auto_refresh
     async def delete_wishlist(self, wishlist_id: str) -> Dict[str, Any]:
         """
         Delete an item from the wishlist.
@@ -407,12 +416,9 @@ class Seedr:
             ...     result = await seedr.delete_wishlist('12345')
             ...     print(result)
         """
-        params = {"access_token": self._access_token, "func": "remove_wishlist"}
         data = {"id": wishlist_id}
-        response = await self._client.post(self.BASE_URL, params=params, data=data)
-        return response.json()
+        return await self._make_request("POST", "remove_wishlist", data=data)
 
-    @auto_refresh
     async def search_files(self, query: str) -> Dict[str, Any]:
         """
         Search for files in the Seedr account.
@@ -428,12 +434,9 @@ class Seedr:
             ...     result = await seedr.search_files('example file')
             ...     print(result)
         """
-        params = {"access_token": self._access_token, "func": "search_files"}
         data = {"search_query": query}
-        response = await self._client.post(self.BASE_URL, params=params, data=data)
-        return response.json()
+        return await self._make_request("POST", "search_files", data=data)
 
-    @auto_refresh
     async def change_name(self, name: str, password: str) -> Dict[str, Any]:
         """
         Change the name of the Seedr account.
@@ -450,12 +453,9 @@ class Seedr:
             ...     result = await seedr.change_name('New Name', 'current_password')
             ...     print(result)
         """
-        params = {"access_token": self._access_token, "func": "user_account_modify"}
         data = {"setting": "fullname", "password": password, "fullname": name}
-        response = await self._client.post(self.BASE_URL, params=params, data=data)
-        return response.json()
+        return await self._make_request("POST", "user_account_modify", data=data)
 
-    @auto_refresh
     async def change_password(
         self, old_password: str, new_password: str
     ) -> Dict[str, Any]:
@@ -474,28 +474,24 @@ class Seedr:
             ...     result = await seedr.change_password('old_password', 'new_password')
             ...     print(result)
         """
-        params = {"access_token": self._access_token, "func": "user_account_modify"}
         data = {
             "setting": "password",
             "password": old_password,
             "new_password": new_password,
             "new_password_repeat": new_password,
         }
-        response = await self._client.post(self.BASE_URL, params=params, data=data)
-        return response.json()
+        return await self._make_request("POST", "user_account_modify", data=data)
 
-    @auto_refresh
-    async def get_devices(self) -> httpx.Response:
+    async def get_devices(self) -> Dict[str, Any]:
         """
         Get the list of devices connected to the Seedr account.
 
         Returns:
-            httpx.Response: The API response containing the list of connected devices.
+            Dict[str, Any]: The API response containing the list of connected devices.
 
         Example:
             >>> async with Seedr(token='your_token_here') as seedr:
             ...     devices = await seedr.get_devices()
-            ...     print(devices.json())
+            ...     print(devices)
         """
-        params = {"access_token": self._access_token, "func": "get_devices"}
-        return await self._client.get(self.BASE_URL, params=params)
+        return await self._make_request("GET", "get_devices")

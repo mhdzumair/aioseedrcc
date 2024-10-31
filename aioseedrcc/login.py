@@ -73,17 +73,24 @@ class Login:
             ...     print(login.token)
     """
 
-    def __init__(self, username: Optional[str] = None, password: Optional[str] = None):
+    def __init__(
+        self,
+        username: Optional[str] = None,
+        password: Optional[str] = None,
+        client: Optional[httpx.AsyncClient] = None,
+    ):
         self._username = username
         self._password = password
         self.token: Optional[str] = None
-        self._client = httpx.AsyncClient()
+        self._client = client or httpx.AsyncClient()
+        self._should_close_client = not client
 
     async def __aenter__(self):
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
-        await self._client.aclose()
+        if self._should_close_client:
+            await self._client.aclose()
 
     async def get_device_code(self) -> Dict[str, Any]:
         """
