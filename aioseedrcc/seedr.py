@@ -6,10 +6,13 @@ a Seedr account, including adding torrents, managing files and folders, and
 handling account settings.
 """
 
+import os
 from base64 import b64decode
-from typing import Optional, Callable, Dict, Any
+from typing import Optional, Callable, Dict, Any, Tuple
 
-import httpx
+import aiohttp
+import aiofiles
+from aiohttp import FormData
 
 from aioseedrcc.exception import SeedrException
 from aioseedrcc.login import Login
@@ -28,7 +31,7 @@ class Seedr:
 
     Args:
         token (str): The authentication token for the Seedr account.
-        httpx_client_args (Optional[Dict[str, Any]]): Optional arguments to pass to the HTTPX client.
+        session_args (Optional[Dict[str, Any]]): Optional arguments to pass to the aiohttp ClientSession.
         token_refresh_callback: Callable[[Seedr, **Any], Coroutine[Any, Any, None]] - async callback function to be called after token refresh
         token_refresh_callback_kwargs: Dict[str, Any] - custom arguments to be passed to the token refresh callback function
 
@@ -43,7 +46,7 @@ class Seedr:
     def __init__(
         self,
         token: str,
-        httpx_client_args: Optional[Dict[str, Any]] = None,
+        session_args: Optional[Dict[str, Any]] = None,
         token_refresh_callback: Optional[Callable] = None,
         token_refresh_callback_kwargs: Optional[Dict[str, Any]] = None,
     ):
@@ -55,11 +58,13 @@ class Seedr:
         self._access_token = token_dict["access_token"]
         self._refresh_token = token_dict.get("refresh_token")
         self._device_code = token_dict.get("device_code")
-        httpx_client_args = httpx_client_args or {
-            "timeout": 10,
-            "transport": httpx.AsyncHTTPTransport(retries=3),
+
+        # Default session arguments
+        self._session_args = session_args or {
+            "timeout": aiohttp.ClientTimeout(total=10),
+            "connector": aiohttp.TCPConnector(limit=10, ttl_dns_cache=300),
         }
-        self._client = httpx.AsyncClient(**httpx_client_args)
+        self._session = aiohttp.ClientSession(**self._session_args)
 
     async def __aenter__(self):
         return self
@@ -71,8 +76,7 @@ class Seedr:
         self,
         method: str,
         func: str,
-        data: Optional[Dict[str, Any]] = None,
-        files: Optional[Dict[str, Any]] = None,
+        data: Optional[Dict[str, Any] | FormData] = None,
         retry_count: int = 1,
     ) -> Dict[str, Any]:
         """
@@ -91,42 +95,38 @@ class Seedr:
         Raises:
             SeedrException: If the API request fails after retries
         """
-        if retry_count > 3:
+        if retry_count > 2:
             raise SeedrException("Max retry attempts reached")
 
         params = {"access_token": self._access_token, "func": func}
 
         try:
-            response = await self._client.request(
-                method, self.BASE_URL, params=params, data=data, files=files
-            )
-            response.raise_for_status()
-            result = response.json()
+            async with self._session.request(
+                method, self.BASE_URL, params=params, data=data
+            ) as response:
+                response.raise_for_status()
+                result = await response.json(content_type=None)
 
-            # Handle expired token
-            if isinstance(result, dict) and result.get("error") == "expired_token":
-                if retry_count > 1:
-                    raise SeedrException("Token refresh failed")
+                # Handle expired token
+                if isinstance(result, dict) and result.get("error") == "expired_token":
+                    if retry_count > 1:
+                        raise SeedrException("Token refresh failed")
 
-                refresh_response = await self.refresh_token()
-                if "error" in refresh_response:
-                    raise SeedrException(
-                        f"Token refresh failed: {refresh_response['error']}"
-                    )
+                    refresh_response = await self.refresh_token()
+                    if "error" in refresh_response:
+                        raise SeedrException(
+                            f"Token refresh failed: {refresh_response['error']}"
+                        )
 
-                # Retry the request with new token
-                return await self._make_request(
-                    method, func, data, files, retry_count + 1
-                )
+                    # Retry the request with new token
+                    return await self._make_request(method, func, data, retry_count + 1)
 
-            return result
+                return result
 
-        except httpx.HTTPError as e:
+        except aiohttp.ClientError as e:
             raise SeedrException(f"HTTP request failed: {str(e)}") from e
         except ValueError as e:
             raise SeedrException(f"Invalid JSON response: {str(e)}") from e
-        except (httpx.TransportError, httpx.ConnectTimeout):
-            return await self._make_request(method, func, data, files, retry_count + 1)
         except Exception as e:
             raise SeedrException(f"Request failed: {str(e)}") from e
 
@@ -166,11 +166,11 @@ class Seedr:
                     "refresh_token": self._refresh_token,
                     "client_id": "seedr_chrome",
                 }
-                response = await self._client.post(url, data=data)
-                response.raise_for_status()
-                response_json = response.json()
+                async with self._session.post(url, data=data) as response:
+                    response.raise_for_status()
+                    response_json = await response.json(content_type=None)
             else:
-                async with Login(client=self._client) as login:
+                async with Login(session=self._session) as login:
                     response_json = await login.authorize(device_code=self._device_code)
 
             if "access_token" in response_json:
@@ -186,7 +186,7 @@ class Seedr:
             else:
                 raise SeedrException("No access token in refresh response")
 
-        except httpx.HTTPError as e:
+        except aiohttp.ClientError as e:
             raise SeedrException(f"Token refresh request failed: {str(e)}") from e
         except Exception as e:
             raise SeedrException(f"Token refresh failed: {str(e)}") from e
@@ -219,6 +219,79 @@ class Seedr:
         """
         return await self._make_request("GET", "get_memory_bandwidth")
 
+    async def _download_remote_torrent(self, url: str) -> bytes:
+        """
+        Download a torrent file from a remote URL.
+
+        Args:
+            url (str): The URL of the torrent file.
+
+        Returns:
+            bytes: The content of the torrent file.
+
+        Raises:
+            SeedrException: If the download fails.
+        """
+        try:
+            async with self._session.get(url) as response:
+                response.raise_for_status()
+                return await response.read()
+        except aiohttp.ClientError as e:
+            raise SeedrException(
+                f"Failed to download remote torrent file: {str(e)}"
+            ) from e
+
+    async def _read_local_torrent(self, file_path: str) -> Tuple[bytes, str]:
+        """
+        Read a torrent file from the local filesystem.
+
+        Args:
+            file_path (str): Path to the local torrent file.
+
+        Returns:
+            Tuple[bytes, str]: The content of the torrent file and its filename.
+
+        Raises:
+            SeedrException: If reading the file fails.
+        """
+        try:
+            async with aiofiles.open(file_path, mode="rb") as file:
+                content = await file.read()
+                return content, os.path.basename(file_path)
+        except IOError as e:
+            raise SeedrException(f"Failed to read local torrent file: {str(e)}") from e
+
+    def _create_torrent_form(
+        self, torrent_content: bytes, filename: str, data: Dict[str, Any]
+    ) -> aiohttp.FormData:
+        """
+        Create a FormData object with torrent file and additional data.
+
+        Args:
+            torrent_content (bytes): The content of the torrent file.
+            filename (str): Name of the torrent file.
+            data (Dict[str, Any]): Additional form data.
+
+        Returns:
+            aiohttp.FormData: The prepared form data.
+        """
+        form = aiohttp.FormData()
+
+        # Add the torrent file
+        form.add_field(
+            "torrent_file",
+            torrent_content,
+            filename=filename,
+            content_type="application/x-bittorrent",
+        )
+
+        # Add other form fields
+        for key, value in data.items():
+            if value is not None:
+                form.add_field(key, str(value))
+
+        return form
+
     async def add_torrent(
         self,
         magnet_link: Optional[str] = None,
@@ -238,6 +311,9 @@ class Seedr:
         Returns:
             Dict[str, Any]: The API response after adding the torrent.
 
+        Raises:
+            SeedrException: If there's an error reading the torrent file or making the request.
+
         Example:
             Adding a torrent using a magnet link:
                 >>> async with Seedr(token='your_token_here') as seedr:
@@ -254,20 +330,25 @@ class Seedr:
             "wishlist_id": wishlist_id,
             "folder_id": folder_id,
         }
-        files = {}
 
-        if torrent_file:
-            try:
-                if torrent_file.startswith(("http://", "https://")):
-                    response = await self._client.get(torrent_file)
-                    response.raise_for_status()
-                    files = {"torrent_file": ("torrent_file", response.content)}
-                else:
-                    files = {"torrent_file": open(torrent_file, "rb")}
-            except (httpx.HTTPError, IOError) as e:
-                raise SeedrException(f"Failed to read torrent file: {str(e)}") from e
+        if not torrent_file:
+            return await self._make_request("POST", "add_torrent", data=data)
 
-        return await self._make_request("POST", "add_torrent", data=data, files=files)
+        try:
+            # Handle remote or local torrent file
+            if torrent_file.startswith(("http://", "https://")):
+                content = await self._download_remote_torrent(torrent_file)
+                filename = "torrent_file"
+            else:
+                content, filename = await self._read_local_torrent(torrent_file)
+
+            # Create form data with torrent file and additional data
+            form = self._create_torrent_form(content, filename, data)
+
+            return await self._make_request("POST", "add_torrent", data=form)
+
+        except Exception as e:
+            raise SeedrException(f"Error processing torrent file: {str(e)}") from e
 
     async def scan_page(self, url: str) -> Dict[str, Any]:
         """

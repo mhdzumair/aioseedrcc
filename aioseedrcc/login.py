@@ -9,7 +9,7 @@ import asyncio
 from base64 import b64encode
 from typing import Optional, Dict, Any
 
-import httpx
+import aiohttp
 
 
 def create_token(
@@ -77,20 +77,34 @@ class Login:
         self,
         username: Optional[str] = None,
         password: Optional[str] = None,
-        client: Optional[httpx.AsyncClient] = None,
+        session: Optional[aiohttp.ClientSession] = None,
+        session_args: Optional[Dict[str, Any]] = None,
     ):
         self._username = username
         self._password = password
         self.token: Optional[str] = None
-        self._client = client or httpx.AsyncClient()
-        self._should_close_client = not client
+
+        if session:
+            self._session = session
+            self._should_close_session = False
+        else:
+            # Default session arguments if none provided
+            session_args = session_args or {
+                "timeout": aiohttp.ClientTimeout(total=10),
+                "connector": aiohttp.TCPConnector(limit=10, ttl_dns_cache=300),
+            }
+            self._session = None  # Will be initialized in __aenter__
+            self._session_args = session_args
+            self._should_close_session = True
 
     async def __aenter__(self):
+        if self._session is None:
+            self._session = aiohttp.ClientSession(**self._session_args)
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
-        if self._should_close_client:
-            await self._client.aclose()
+        if self._should_close_session and self._session:
+            await self._session.close()
 
     async def get_device_code(self) -> Dict[str, Any]:
         """
@@ -108,8 +122,9 @@ class Login:
         url = "https://www.seedr.cc/api/device/code"
         params = {"client_id": "seedr_xbmc"}
 
-        response = await self._client.get(url, params=params)
-        return response.json()
+        async with self._session.get(url, params=params) as response:
+            response.raise_for_status()
+            return await response.json(content_type=None)
 
     async def authorize(self, device_code: Optional[str] = None) -> Dict[str, Any]:
         """
@@ -127,6 +142,7 @@ class Login:
 
         Raises:
             ValueError: If neither username/password nor device_code is provided.
+            aiohttp.ClientError: If the request fails.
 
         Example:
             Authorizing with username and password:
@@ -145,7 +161,10 @@ class Login:
         if device_code:
             url = "https://www.seedr.cc/api/device/authorize"
             params = {"client_id": "seedr_xbmc", "device_code": device_code}
-            response = await self._client.get(url, params=params)
+
+            async with self._session.get(url, params=params) as response:
+                response.raise_for_status()
+                response_json = await response.json(content_type=None)
 
         elif self._username and self._password:
             url = "https://www.seedr.cc/oauth_test/token.php"
@@ -156,12 +175,13 @@ class Login:
                 "username": self._username,
                 "password": self._password,
             }
-            response = await self._client.post(url, data=data)
+
+            async with self._session.post(url, data=data) as response:
+                response.raise_for_status()
+                response_json = await response.json(content_type=None)
 
         else:
             raise ValueError("No device code or email/password provided")
-
-        response_json = response.json()
 
         if "access_token" in response_json:
             self.token = create_token(response_json, device_code=device_code)

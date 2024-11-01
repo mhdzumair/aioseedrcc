@@ -1,16 +1,19 @@
 [tool.poetry]
 name = "aioseedrcc"
-version = "0.2.0"
+version = "0.3.0"
 description = "AIOSeedrcc is a Python asyncrnous library for interacting with Seedr.cc API."
 authors = ["mhdzumair <mhdzumair@gmail.com>"]
 readme = "README.md"
 license = "MIT"
 repository = "https://github.com/mhdzumair/aioseedrcc"
 documentation = "https://aioseedrcc.rtfd.io"
+homepage = "https://aioseedrcc.rtfd.io"
+keywords = ["seedr", "seedr.cc", "torrent", "api", "asyncio", "aiohttp"]
 
 [tool.poetry.dependencies]
 python = ">=3.10"
-httpx = "^0.27.2"
+aiohttp = "^3.10.10"
+aiofiles = "^24.1.0"
 
 
 [tool.poetry.group.dev.dependencies]
