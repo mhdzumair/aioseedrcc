@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "aioseedrcc"
-version = "0.3.0"
+version = "0.3.1"
 description = "AIOSeedrcc is a Python asyncrnous library for interacting with Seedr.cc API."
 authors = ["mhdzumair <mhdzumair@gmail.com>"]
 readme = "README.md"

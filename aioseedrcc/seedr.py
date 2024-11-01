@@ -62,7 +62,7 @@ class Seedr:
         # Default session arguments
         self._session_args = session_args or {
             "timeout": aiohttp.ClientTimeout(total=10),
-            "connector": aiohttp.TCPConnector(limit=10, ttl_dns_cache=300),
+            "connector": aiohttp.TCPConnector(ttl_dns_cache=300),
         }
         self._session = aiohttp.ClientSession(**self._session_args)
 
@@ -70,7 +70,7 @@ class Seedr:
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
-        await self._client.aclose()
+        await self._session.close()
 
     async def _make_request(
         self,
@@ -78,6 +78,7 @@ class Seedr:
         func: str,
         data: Optional[Dict[str, Any] | FormData] = None,
         retry_count: int = 1,
+        **kwargs,
     ) -> Dict[str, Any]:
         """
         Make a request to the Seedr API with automatic token refresh handling.
@@ -86,7 +87,6 @@ class Seedr:
             method: HTTP method ("GET" or "POST")
             func: API function name
             data: Optional POST data
-            files: Optional files to upload
             retry_count: Number of retries attempted (internal use)
 
         Returns:
@@ -102,7 +102,7 @@ class Seedr:
 
         try:
             async with self._session.request(
-                method, self.BASE_URL, params=params, data=data
+                method, self.BASE_URL, params=params, data=data, **kwargs
             ) as response:
                 response.raise_for_status()
                 result = await response.json(content_type=None)
@@ -241,7 +241,8 @@ class Seedr:
                 f"Failed to download remote torrent file: {str(e)}"
             ) from e
 
-    async def _read_local_torrent(self, file_path: str) -> Tuple[bytes, str]:
+    @staticmethod
+    async def _read_local_torrent(file_path: str) -> Tuple[bytes, str]:
         """
         Read a torrent file from the local filesystem.
 
@@ -261,8 +262,9 @@ class Seedr:
         except IOError as e:
             raise SeedrException(f"Failed to read local torrent file: {str(e)}") from e
 
+    @staticmethod
     def _create_torrent_form(
-        self, torrent_content: bytes, filename: str, data: Dict[str, Any]
+        torrent_content: bytes, filename: str, data: Dict[str, Any]
     ) -> aiohttp.FormData:
         """
         Create a FormData object with torrent file and additional data.
@@ -332,7 +334,9 @@ class Seedr:
         }
 
         if not torrent_file:
-            return await self._make_request("POST", "add_torrent", data=data)
+            return await self._make_request(
+                "POST", "add_torrent", data=data, timeout=30
+            )
 
         try:
             # Handle remote or local torrent file
@@ -345,7 +349,9 @@ class Seedr:
             # Create form data with torrent file and additional data
             form = self._create_torrent_form(content, filename, data)
 
-            return await self._make_request("POST", "add_torrent", data=form)
+            return await self._make_request(
+                "POST", "add_torrent", data=form, timeout=30
+            )
 
         except Exception as e:
             raise SeedrException(f"Error processing torrent file: {str(e)}") from e
