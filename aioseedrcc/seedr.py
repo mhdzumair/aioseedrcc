@@ -297,6 +297,7 @@ class Seedr:
     async def add_torrent(
         self,
         magnet_link: Optional[str] = None,
+        torrent_file_content: Optional[bytes] = None,
         torrent_file: Optional[str] = None,
         wishlist_id: Optional[str] = None,
         folder_id: str = "-1",
@@ -306,6 +307,7 @@ class Seedr:
 
         Args:
             magnet_link (Optional[str]): The magnet link of the torrent.
+            torrent_file_content (Optional[bytes]): The content of the torrent file.
             torrent_file (Optional[str]): Remote or local path of the torrent file.
             wishlist_id (Optional[str]): The wishlist ID to add the torrent to.
             folder_id (str): The folder ID to add the torrent to. Default to '-1' (root folder).
@@ -326,6 +328,13 @@ class Seedr:
                 >>> async with Seedr(token='your_token_here') as seedr:
                 ...     result = await seedr.add_torrent(torrent_file='/path/to/file.torrent')
                 ...     print(result)
+
+            Adding a torrent from a torrent file content:
+                >>> async with Seedr(token='your_token_here') as seedr:
+                ...     with open('/path/to/file.torrent', 'rb') as file:
+                ...         content = file.read()
+                ...     result = await seedr.add_torrent(torrent_file_content=content, torrent_file='file.torrent')
+                ...     print(result)
         """
         data = {
             "torrent_magnet": magnet_link,
@@ -343,6 +352,9 @@ class Seedr:
             if torrent_file.startswith(("http://", "https://")):
                 content = await self._download_remote_torrent(torrent_file)
                 filename = "torrent_file"
+            elif torrent_file_content:
+                content = torrent_file_content
+                filename = torrent_file or "torrent_file"
             else:
                 content, filename = await self._read_local_torrent(torrent_file)
 
